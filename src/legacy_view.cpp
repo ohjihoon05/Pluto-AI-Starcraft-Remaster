@@ -66,11 +66,43 @@ void LegacyView::sprite(uint32_t dest,uint32_t raw) {
 void LegacyView::update() {
   raw_start=scr::units();raw_length=scr::read<uint32_t>(scr::addr(0x10436f4));
   if(!raw_start || !raw_length || raw_length>8192)throw std::runtime_error("Invalid SCR unit vector");
-  std::unordered_set<uint32_t> present;
-  for(unsigned i=0;i<raw_length;++i) {
-    auto raw=raw_start+i*336;
-    if(scr::read<uint32_t>(raw+12) && scr::read<uint16_t>(raw+100)<228)present.insert(raw);
+  // Walk the three SCR unit lists in their own order, drop hidden owners, and
+  // order the active list for Pluto (own, enemies, neutrals by distance) so the
+  // model's tail truncation and the 1700-slot table lose far neutrals first.
+  const auto valid=[&](uint32_t raw) {
+    return raw>=raw_start && raw<raw_start+raw_length*336 && (raw-raw_start)%336==0 &&
+      scr::read<uint32_t>(raw+12) && scr::read<uint16_t>(raw+100)<228;
+  };
+  const auto walk=[&](uint32_t head) {
+    std::vector<uint32_t> out;std::unordered_set<uint32_t> seen;
+    for(auto raw=head;raw && out.size()<8192 && seen.insert(raw).second;raw=scr::read<uint32_t>(raw+4))if(valid(raw))out.push_back(raw);
+    return out;
+  };
+  const auto hidden_owner=[&](uint32_t raw){const auto owner=scr::read<uint8_t>(raw+76);return owner<8 && hide_player[owner];};
+  const auto active_raw=walk(scr::first_active_unit());
+  std::vector<uint32_t> hidden_list,scan_list;
+  for(auto raw:walk(scr::first_hidden_unit()))if(!hidden_owner(raw))hidden_list.push_back(raw);
+  for(auto raw:walk(scr::read<uint32_t>(scr::addr(0x10436b8))))if(!hidden_owner(raw))scan_list.push_back(raw);
+  OrderInput order_in;order_in.self=scr::local_player_id();order_in.hidden=hide_player;
+  if(const auto g=scr::game();g && order_in.self<8) {
+    order_in.home_x=scr::read<uint16_t>(g+layout::Game::start_position+order_in.self*4);
+    order_in.home_y=scr::read<uint16_t>(g+layout::Game::start_position+order_in.self*4+2);
   }
+  const size_t reserved=hidden_list.size()+scan_list.size();
+  order_in.capacity=slots.size()>reserved?slots.size()-reserved:0;
+  if(max_active_units && order_in.capacity>max_active_units)order_in.capacity=max_active_units;
+  std::vector<UnitEntry> entries;entries.reserve(active_raw.size());
+  hidden_units=0;
+  for(auto raw:active_raw) {
+    if(hidden_owner(raw)){++hidden_units;continue;}
+    entries.push_back({raw,scr::read<uint8_t>(raw+76),scr::read<uint16_t>(raw+40),scr::read<uint16_t>(raw+42)});
+  }
+  size_t dropped=0;
+  std::vector<uint32_t> active_list;
+  for(auto index:order_units(entries,order_in,&dropped))active_list.push_back(entries[index].raw);
+  dropped_units=static_cast<unsigned>(dropped);
+  std::unordered_set<uint32_t> present(active_list.begin(),active_list.end());
+  present.insert(hidden_list.begin(),hidden_list.end());present.insert(scan_list.begin(),scan_list.end());
   if(present.size()>slots.size())throw std::runtime_error("Pluto's legacy unit view exceeded 1700 simultaneous units");
   for(unsigned i=0;i<slots.size();++i)if(slots[i].raw && !present.count(slots[i].raw)) {
     lookup.erase(slots[i].raw);slots[i].raw=0;
@@ -90,9 +122,6 @@ void LegacyView::update() {
   std::memcpy(reinterpret_cast<void*>(address(0x57eee0)),reinterpret_cast<void*>(scr::players()),12*36);
   put<uint32_t>(address(0x512688),scr::local_player_id());
   put<uint32_t>(address(0x59688c),scr::is_multiplayer()?1u:0u);put<uint16_t>(address(0x596904),2);
-  put<uint32_t>(address(0x628430),unit(scr::first_active_unit()));
-  put<uint32_t>(address(0x6283ec),unit(scr::first_hidden_unit()));
-  put<uint32_t>(address(0x6283f4),unit(scr::read<uint32_t>(scr::addr(0x10436b8))));
   put<uint32_t>(address(0x6d1260),scr::map_tile_flags());
   for(unsigned i=0;i<slots.size();++i)if(slots[i].raw) {
     const auto raw=slots[i].raw,dest=address(unit_base+i*336);
@@ -117,6 +146,17 @@ void LegacyView::update() {
       put<uint16_t>(dest+176+n*2,legacy);
     }
   }
+  // Rebuild the three legacy lists from the kept units only; this overrides the
+  // raw prev/next conversion above, which would stop at the first removed unit.
+  const auto relink=[&](uint32_t head,const std::vector<uint32_t>& list) {
+    put<uint32_t>(address(head),list.empty()?0:unit(list[0]));
+    for(size_t i=0;i<list.size();++i) {
+      const auto dest=unit(list[i]);
+      put<uint32_t>(dest,i?unit(list[i-1]):0);
+      put<uint32_t>(dest+4,i+1<list.size()?unit(list[i+1]):0);
+    }
+  };
+  relink(0x628430,active_list);relink(0x6283ec,hidden_list);relink(0x6283f4,scan_list);
   std::vector<uint32_t> raw_bullets;
   std::unordered_set<uint32_t> visited_bullets;
   for(auto bullet=scr::read<uint32_t>(scr::addr(0x1034a78));bullet;bullet=scr::read<uint32_t>(bullet+4)) {

@@ -17,6 +17,9 @@
 #include <memory>
 #include <exception>
 #include <stdexcept>
+#include <cctype>
+#include <fstream>
+#include <string>
 
 namespace {
 HMODULE bridge_module;
@@ -35,6 +38,15 @@ bool speed_changed=false;
 bool unsupported_session_reported=false;
 bool allow_multiplayer=false;
 bool challenge_mode=false;
+bool any_game=false;
+bool no_resign=false;
+unsigned max_units=0;
+bool quiet=true; // in-game notices off unless bridge.ini show_messages=1; everything still goes to bridge.log
+bool resign_reported=false;
+bool view_stats_reported=false;
+std::string opening;
+std::array<bool,8> hidden_players{};
+std::vector<std::string> allowed_opponents;
 unsigned submitted_packets=0;
 DWORD game_thread=0;
 int speed_ms=0;
@@ -42,6 +54,7 @@ std::array<uint32_t,7> saved_speed{},saved_alt_speed{};
 thread_local bool in_callback=false;
 
 void print_local(const std::vector<std::string>& lines) {
+  if(quiet)return;
   // SCR consumes UTF-8 here. Display only on this client, without network chat.
   for(const auto& line:lines)
     reinterpret_cast<void (__cdecl*)(const char*,uint32_t,uint32_t)>(scr::print_text())(line.c_str(),16,0);
@@ -55,6 +68,7 @@ Session read_session(uint32_t g) {
   session.self=scr::local_player_id();
   for(unsigned i=0;i<8;++i) {
     session.players[i]=scr::read<uint8_t>(scr::players()+i*layout::Player::size+layout::Player::player_type);
+    std::memcpy(session.names[i].data(),reinterpret_cast<void*>(scr::players()+i*layout::Player::size+layout::Player::name),25);
     for(unsigned j=0;j<8;++j)session.alliances[i][j]=scr::read<uint8_t>(g+layout::Game::alliances+i*12+j);
   }
   return session;
@@ -88,6 +102,41 @@ void finish_match() {
   std::fprintf(log_file,"{\"stage\":\"match_end\",\"frame\":%d,\"winner\":%s,\"packets_submitted\":%u}\n",last_frame,won?"true":"false",submitted_packets);
   std::fflush(log_file);
 }
+// -Opening free: pre-seed Pluto's per-opponent bandit file so Thompson sampling
+// picks the hint-free arm (mask 0). Uses Pluto's own key rule: first participant
+// other than self, 25 bytes, characters outside [A-Za-z0-9_\-./] become '_'.
+void seed_opening_free() {
+  const auto self=scr::local_player_id();
+  std::string name;
+  for(unsigned i=0;i<8;++i) {
+    const auto raw=scr::players()+i*layout::Player::size;
+    const auto type=scr::read<uint8_t>(raw+layout::Player::player_type);
+    if(i==self || (type!=1 && type!=2))continue;
+    char buffer[26]{};std::memcpy(buffer,reinterpret_cast<void*>(raw+layout::Player::name),25);
+    name=buffer;break;
+  }
+  for(auto& c:name)if(!(std::isalnum(static_cast<unsigned char>(c)) || c=='_' || c=='-' || c=='.' || c=='/'))c='_';
+  if(name.empty())name="unknown";
+  std::filesystem::create_directories("bwapi-data/write");
+  const auto path="bwapi-data/write/pluto_bandit_"+name+".txt";
+  unsigned long long seq=0;std::vector<std::string> records;
+  if(std::ifstream in(path);in) {
+    std::string line;
+    while(std::getline(in,line)) {
+      while(!line.empty() && (line.back()=='\r' || line.back()=='\n'))line.pop_back();
+      if(line.rfind("seq ",0)==0)seq=std::strtoull(line.c_str()+4,nullptr,10);
+      else if(!line.empty() && line[0]=='{')records.push_back(line);
+    }
+  }
+  std::ofstream out(path+".tmp",std::ios::binary);
+  out<<"# seeded by pluto-scr bridge: opening=free (mask 0x0 strongly preferred)\n";
+  out<<"seq "<<(seq+1000)<<"\n";
+  for(const char own:{'Z','T','P'})for(const char opp:{'Z','T','P','?'})out<<own<<' '<<opp<<" 0x00000000 100 0\n";
+  for(const auto& record:records)out<<record<<"\n";
+  out<<"end\n";out.close();
+  MoveFileExA((path+".tmp").c_str(),path.c_str(),MOVEFILE_REPLACE_EXISTING);
+  std::fprintf(log_file,"{\"stage\":\"opening_seeded\",\"file\":\"%s\",\"seq\":%llu}\n",path.c_str(),seq+1000);std::fflush(log_file);
+}
 void load_bot() {
   if(!bot_path[0])return;
   BWAPI::BWAPIClient.data=snapshot->data.get();
@@ -98,8 +147,9 @@ void load_bot() {
     if(file_sha256(bot_path)!=pluto_sha256)throw std::runtime_error("Unsupported Pluto DLL SHA-256; expected CoG 2026 release");
     bot_module=LoadLibraryExW(bot_path,nullptr,LOAD_WITH_ALTERED_SEARCH_PATH);
     if(!bot_module)throw std::runtime_error("Cannot load configured Pluto DLL");
-    legacy=std::make_unique<LegacyView>();legacy->update();legacy->bind(bot_module);
-  }else{legacy->reset();legacy->update();}
+    legacy=std::make_unique<LegacyView>();legacy->max_active_units=max_units;legacy->hide_player=hidden_players;legacy->update();legacy->bind(bot_module);
+  }else{legacy->reset();legacy->hide_player=hidden_players;legacy->update();}
+  if(opening=="free")seed_opening_free();
   const auto init=reinterpret_cast<void (__cdecl*)(BWAPI::Game*)>(GetProcAddress(bot_module,"gameInit"));
   const auto create=reinterpret_cast<BWAPI::AIModule* (__cdecl*)()>(GetProcAddress(bot_module,"newAIModule"));
   if(!init || !create)throw std::runtime_error("Missing BWAPI exports");
@@ -113,7 +163,12 @@ void load_bot() {
 void run_bot(bool first) {
   if(!bot)return;
   auto& d=*snapshot->data;
+  legacy->hide_player=hidden_players;
   legacy->update();
+  if(!view_stats_reported && (legacy->hidden_units || legacy->dropped_units)) {
+    std::fprintf(log_file,"{\"stage\":\"view_filtered\",\"frame\":%d,\"hidden_units\":%u,\"dropped_units\":%u}\n",d.frameCount,legacy->hidden_units,legacy->dropped_units);
+    view_stats_reported=true;
+  }
   legacy->begin_frame(log_file,d.frameCount);
   if(!first)api_game->onMatchFrame();
   if(!first)for(const auto& e:api_game->getEvents()) {
@@ -143,6 +198,16 @@ void run_bot(bool first) {
     // The launcher's explicit speed policy takes priority over Pluto's onStart
     // request to uncap. A negative setting leaves the game's own speed intact.
     if(c.type==BWAPIC::CommandType::SetLocalSpeed)set_speed(speed_ms);
+    if(c.type==BWAPIC::CommandType::LeaveGame && no_resign) {
+      // Pluto resigns when its win estimate stays pinned low; in team or custom
+      // games that estimate is unreliable, so keep playing and ignore the request.
+      if(!resign_reported) {
+        resign_reported=true;
+        std::fprintf(log_file,"{\"stage\":\"resign_suppressed\",\"frame\":%d}\n",d.frameCount);
+        print_local({u8"플루토가 기권하려 했지만 계속 플레이합니다 (-NoResign)."});
+      }
+      continue;
+    }
     if(c.type==BWAPIC::CommandType::LeaveGame) {
       // Multiplayer departure must use the game's normal loop teardown. Do not
       // change simulation victory state locally, which peers would not observe.
@@ -170,12 +235,14 @@ void update_frame() {
     if(api_game)api_game->onMatchEnd();
     BWAPI::BroodwarPtr=nullptr;BWAPI::BWAPIClient.data=nullptr;
     api_game.reset();snapshot.reset();bot=nullptr;
-    last_frame=-1;match_ended=false;submitted_packets=0;
+    last_frame=-1;match_ended=false;submitted_packets=0;resign_reported=false;view_stats_reported=false;
   }
   if(match_ended)return;
   if(frame==last_frame)return;
-  const auto session=read_session(g);
-  if(last_frame>=0 && session_has_local_ally(session)) {
+  auto session=read_session(g);
+  for(unsigned i=0;i<8;++i)hidden_players[i]=any_game && i!=session.self && session.self<8 && session.players[i]!=0 &&
+    (session.alliances[session.self][i]!=0 || session.alliances[i][session.self]!=0);
+  if(last_frame>=0 && !any_game && session_has_local_ally(session)) {
     // A new alliance cannot be represented by the original model. Stop this
     // match's AI and discard commands queued before the alliance changed.
     if(legacy)legacy->discard_pending_turns();
@@ -185,11 +252,13 @@ void update_frame() {
     finish_match();return;
   }
   if(last_frame<0) {
-    if(const auto reason=session_rejection(session,allow_multiplayer,challenge_mode)) {
+    auto reason=session_rejection(session,allow_multiplayer,challenge_mode,any_game);
+    if(!reason && session.multiplayer)reason=session_opponent_rejection(session,allowed_opponents,any_game);
+    if(reason) {
       if(!unsupported_session_reported) {
-        std::fprintf(log_file,"{\"stage\":\"session_skipped\",\"reason\":\"%s\",\"game_type\":%u,\"game_type_name\":\"%s\",\"self\":%u,\"multiplayer\":%s,\"multiplayer_enabled\":%s,\"player_types\":[",
+        std::fprintf(log_file,"{\"stage\":\"session_skipped\",\"reason\":\"%s\",\"game_type\":%u,\"game_type_name\":\"%s\",\"self\":%u,\"multiplayer\":%s,\"multiplayer_enabled\":%s,\"opponent\":\"%s\",\"player_types\":[",
           reason,session.game_type,session_game_type(session.game_type),session.self,
-          session.multiplayer?"true":"false",allow_multiplayer?"true":"false");
+          session.multiplayer?"true":"false",allow_multiplayer?"true":"false",session_opponent_name(session));
         for(unsigned i=0;i<8;++i)std::fprintf(log_file,"%s%u",i?",":"",session.players[i]);
         std::fprintf(log_file,"]}\n");
         std::fflush(log_file);unsupported_session_reported=true;
@@ -198,8 +267,13 @@ void update_frame() {
       return;
     }
     unsupported_session_reported=false;
-    std::fprintf(log_file,"{\"stage\":\"session_accepted\",\"multiplayer\":%s,\"self\":%u,\"game_type\":%u,\"participants\":%u,\"challenge\":%s}\n",
-      session.multiplayer?"true":"false",session.self,session.game_type,session_participant_count(session),challenge_mode?"true":"false");
+    std::fprintf(log_file,"{\"stage\":\"session_accepted\",\"multiplayer\":%s,\"self\":%u,\"game_type\":%u,\"participants\":%u,\"challenge\":%s,\"any_game\":%s,\"opponent\":\"%s\"}\n",
+      session.multiplayer?"true":"false",session.self,session.game_type,session_participant_count(session),challenge_mode?"true":"false",any_game?"true":"false",session_opponent_name(session));
+    if(any_game) {
+      std::vector<std::string> lines{u8"플루토 무제한 모드: "+std::string(session_game_type(session.game_type))+u8", 참가자 "+std::to_string(session_participant_count(session))+u8"명."};
+      if(session_has_local_ally(session))lines.push_back(u8"동맹 플레이어의 유닛은 플루토 관측에서 제외합니다 (공격 안 함).");
+      print_local(lines);
+    }
     if(challenge_mode)print_local({u8"플루토 콘텐츠 실험 모드: 1 대 "+std::to_string(session_participant_count(session)-1)+u8" 경기입니다.",
       u8"1대1 모델을 사용하므로 다인전 전투력과 승률 예측은 검증 전입니다."});
   }
@@ -250,11 +324,58 @@ DWORD WINAPI initialize(void*) {
   speed_ms=GetPrivateProfileIntW(L"pluto",L"speed_ms",0,(directory/L"bridge.ini").c_str());
   allow_multiplayer=GetPrivateProfileIntW(L"pluto",L"multiplayer",0,(directory/L"bridge.ini").c_str())==1;
   challenge_mode=GetPrivateProfileIntW(L"pluto",L"challenge",0,(directory/L"bridge.ini").c_str())==1;
+  any_game=GetPrivateProfileIntW(L"pluto",L"any_game",0,(directory/L"bridge.ini").c_str())==1;
+  no_resign=GetPrivateProfileIntW(L"pluto",L"no_resign",0,(directory/L"bridge.ini").c_str())==1;
+  quiet=GetPrivateProfileIntW(L"pluto",L"show_messages",0,(directory/L"bridge.ini").c_str())!=1;
+  max_units=GetPrivateProfileIntW(L"pluto",L"max_units",0,(directory/L"bridge.ini").c_str());
+  {
+    wchar_t value[32]{};GetPrivateProfileStringW(L"pluto",L"opening",L"auto",value,32,(directory/L"bridge.ini").c_str());
+    opening.clear();for(const wchar_t* c=value;*c;++c)opening+=static_cast<char>(*c); // ascii keywords only
+  }
+  // Pluto writes pluto.log and bwapi-data/ relative to the process CWD. A game
+  // started by the Battle.net app (-Attach) has an arbitrary CWD; pin it here.
+  SetCurrentDirectoryW(directory.c_str());
   if(speed_ms>1000)speed_ms=1000;
+  {
+    // Comma-separated opponent account names; empty = everyone. Compared as UTF-8 against the in-game name field.
+    wchar_t raw[4096]{};
+    GetPrivateProfileStringW(L"pluto",L"opponents",L"",raw,4096,(directory/L"bridge.ini").c_str());
+    std::wstring entry;
+    for(const wchar_t* p=raw;;++p) {
+      if(*p && *p!=L',') {entry+=*p;continue;}
+      while(!entry.empty() && entry.back()==L' ')entry.pop_back();
+      size_t start=0;while(start<entry.size() && entry[start]==L' ')++start;
+      if(start<entry.size()) {
+        const auto size=WideCharToMultiByte(CP_UTF8,0,entry.c_str()+start,-1,nullptr,0,nullptr,nullptr);
+        std::string utf8(size>0?size-1:0,'\0');
+        if(size>1)WideCharToMultiByte(CP_UTF8,0,entry.c_str()+start,-1,utf8.data(),size,nullptr,nullptr);
+        if(!utf8.empty())allowed_opponents.push_back(utf8);
+      }
+      entry.clear();
+      if(!*p)break;
+    }
+  }
+  {
+    // Pluto reads BWRL_* through msvcrt getenv, which snapshots the environment
+    // when msvcrt loads. A game started by the Battle.net app inherits nothing
+    // from the launcher, so publish the launcher's settings into that same CRT
+    // before pluto.dll is loaded. Absent ini keys leave the process environment alone.
+    HMODULE crt=LoadLibraryW(L"msvcrt.dll");
+    const auto putenv_=crt?reinterpret_cast<int (__cdecl*)(const char*)>(GetProcAddress(crt,"_putenv")):nullptr;
+    const wchar_t* keys[][2]={{L"draw",L"BWRL_DRAW"},{L"straddle",L"BWRL_STRADDLE"},{L"frame_budget_ms",L"BWRL_FRAME_BUDGET_MS"}};
+    for(const auto& key:keys) {
+      wchar_t value[64]{};
+      if(!GetPrivateProfileStringW(L"pluto",key[0],L"",value,64,(directory/L"bridge.ini").c_str()) || !value[0])continue;
+      char assignment[128]{};
+      std::snprintf(assignment,sizeof assignment,"%ls=%ls",key[1],value);
+      SetEnvironmentVariableW(key[1],value);
+      if(putenv_)putenv_(assignment);
+    }
+  }
   log_file=_wfsopen((directory/"bridge.log").c_str(),L"w",_SH_DENYNO);
   if(!log_file)return 1;
-  std::fprintf(log_file,"{\"stage\":\"initializing\",\"pid\":%lu,\"mode\":\"%s\",\"challenge\":%s}\n",GetCurrentProcessId(),
-    challenge_mode?"challenge_experimental":(allow_multiplayer?"multiplayer_experimental":"offline_pluto"),challenge_mode?"true":"false");std::fflush(log_file);
+  std::fprintf(log_file,"{\"stage\":\"initializing\",\"pid\":%lu,\"mode\":\"%s\",\"challenge\":%s,\"any_game\":%s,\"no_resign\":%s,\"opening\":\"%s\",\"max_units\":%u,\"allowed_opponents\":%zu}\n",GetCurrentProcessId(),
+    challenge_mode?"challenge_experimental":(allow_multiplayer?"multiplayer_experimental":"offline_pluto"),challenge_mode?"true":"false",any_game?"true":"false",no_resign?"true":"false",opening.c_str(),max_units,allowed_opponents.size());std::fflush(log_file);
   try {
     wchar_t executable[32768]{};GetModuleFileNameW(nullptr,executable,32768);
     if(file_sha256(executable)!=scr_sha256)throw std::runtime_error("Unsupported StarCraft executable SHA-256");

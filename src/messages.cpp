@@ -99,6 +99,9 @@ std::vector<std::string> session_messages_ko(const Session& session,std::string_
       u8"사람들은 반대 팀에 배치하세요. 플루토와의 동맹은 지원하지 않습니다."};
   if(reason=="offline_requires_computers")
     return {u8"플루토 시작 불가: 오프라인 상대들은 모두 컴퓨터여야 합니다."};
+  if(reason=="opponent_not_allowed")
+    return {u8"플루토 시작 불가: 허용 목록에 없는 상대입니다 ("+std::string(session.blocked_name[0]?session.blocked_name.data():session_opponent_name(session))+").",
+      u8"실행기의 -Opponents 또는 bridge.ini의 opponents에 상대 계정명을 추가하세요."};
   return {u8"플루토 시작 불가: 지원하지 않는 경기 설정입니다.",u8"진단 코드: "+std::string(reason)};
 }
 

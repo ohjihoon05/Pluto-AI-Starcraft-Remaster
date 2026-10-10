@@ -6,7 +6,21 @@ param(
   [switch]$DrawGraph,
   [switch]$Multiplayer,
   [switch]$Challenge,
-  [switch]$VerifyOnly
+  [switch]$VerifyOnly,
+  # Multiplayer only: opponent account names allowed to face Pluto. Empty = everyone.
+  [string[]]$Opponents = @(),
+  # Attach to the x86 StarCraft already started by the Battle.net app (keeps its Battle.net login).
+  [switch]$Attach,
+  # Run in any game type / player mix (UMS, FFA, Top vs Bottom, teams). The 1v1 model treats allies as enemies.
+  [switch]$AnyGame,
+  # Ignore Pluto's own resignation (default on with -AnyGame: the 1v1 win estimate is unreliable in team games).
+  [switch]$NoResign,
+  # 'free' pre-seeds the per-opponent opening bandit so Pluto plays without a build hint (fastest/UMS maps).
+  [ValidateSet('auto','free')][string]$Opening = 'auto',
+  # Show the bridge's Korean notices in the game chat area (off by default; bridge.log always has them).
+  [switch]$ShowMessages,
+  # Cap the units Pluto observes (nearest own/enemy/neutral first). 0 = default 1700. ~400 halves inference on crowded maps.
+  [ValidateRange(0,1700)][int]$MaxUnits = 0
 )
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path $PSScriptRoot -Parent
@@ -40,8 +54,8 @@ foreach ($name in @('pluto-scr.dll','scr-loader.exe')) {
   if (-not (Test-Path -LiteralPath (Join-Path $bin $name))) { throw "Missing bin/$name. Run scripts/build.ps1 first." }
 }
 if ($VerifyOnly) { Write-Output 'Verified StarCraft, Pluto DLL, inference engine, weights and bridge files.'; return }
-if (Get-Process -Name StarCraft -ErrorAction SilentlyContinue) {
-  throw 'Exit the existing StarCraft process before starting Pluto. No existing game was changed.'
+if (-not $Attach -and (Get-Process -Name StarCraft -ErrorAction SilentlyContinue)) {
+  throw 'Exit the existing StarCraft process before starting Pluto (or use -Attach). No existing game was changed.'
 }
 New-Item -ItemType Directory -Path $runtime -Force | Out-Null
 $previousLogs = @('bridge.log','pluto.log','pluto_infer.log') | ForEach-Object { Join-Path $runtime $_ } | Where-Object { Test-Path -LiteralPath $_ }
@@ -51,7 +65,9 @@ if ($previousLogs) {
   foreach ($path in $previousLogs) { Move-Item -LiteralPath $path -Destination $archive }
 }
 Copy-Item -LiteralPath (Join-Path $bin 'pluto-scr.dll') -Destination $runtime -Force
-@('[pluto]',"module=$Pluto","speed_ms=$SpeedMs","multiplayer=$([int]$Multiplayer.IsPresent)","challenge=$([int]$Challenge.IsPresent)") | Set-Content -LiteralPath (Join-Path $runtime 'bridge.ini') -Encoding Unicode
+@('[pluto]',"module=$Pluto","speed_ms=$SpeedMs","multiplayer=$([int]$Multiplayer.IsPresent)","challenge=$([int]$Challenge.IsPresent)","opponents=$($Opponents -join ',')",
+  "draw=$([int]$DrawGraph.IsPresent)","any_game=$([int]$AnyGame.IsPresent)","no_resign=$([int]($NoResign.IsPresent -or $AnyGame.IsPresent))","opening=$Opening","show_messages=$([int]$ShowMessages.IsPresent)","max_units=$MaxUnits","straddle=$([int]$Multiplayer.IsPresent)",
+  "frame_budget_ms=$(if ($env:BWRL_FRAME_BUDGET_MS) { $env:BWRL_FRAME_BUDGET_MS } elseif ($Multiplayer) { '10' })") | Set-Content -LiteralPath (Join-Path $runtime 'bridge.ini') -Encoding Unicode
 $previousDraw = $env:BWRL_DRAW
 $previousStraddle = $env:BWRL_STRADDLE
 $previousBudget = $env:BWRL_FRAME_BUDGET_MS
@@ -61,7 +77,16 @@ try {
     $env:BWRL_STRADDLE = '1'
     if (-not $env:BWRL_FRAME_BUDGET_MS) { $env:BWRL_FRAME_BUDGET_MS = '10' }
   }
-  $game = Start-Process -FilePath $StarCraft -ArgumentList '-launch' -WorkingDirectory $runtime -WindowStyle Hidden -PassThru
+  if ($Attach) {
+    $running = @(Get-Process -Name StarCraft -ErrorAction SilentlyContinue)
+    $game = $running | Where-Object { $_.Path -eq $StarCraft } | Select-Object -First 1
+    if (-not $game) {
+      if ($running) { throw "A StarCraft process is running but it is not $StarCraft (64-bit client?). In the Battle.net app: StarCraft > Options > Game Settings > 'Launch 32-bit client', then Play." }
+      throw "No running $StarCraft. Start StarCraft from the Battle.net app (32-bit client enabled), log in, then rerun with -Attach."
+    }
+  } else {
+    $game = Start-Process -FilePath $StarCraft -ArgumentList '-launch' -WorkingDirectory $runtime -WindowStyle Hidden -PassThru
+  }
 } finally {
   $env:BWRL_DRAW = $previousDraw
   $env:BWRL_STRADDLE = $previousStraddle
@@ -91,6 +116,9 @@ try {
   } elseif ($Multiplayer) {
     Write-Output "Experimental multiplayer bridge ready in StarCraft process $($game.Id). Choose a custom 1v1 Melee game."
     Write-Output 'Network synchronization with a second client still requires validation. The game controls multiplayer speed.'
+    Write-Output "Allowed opponents: $(if ($Opponents) { $Opponents -join ', ' } else { '(everyone)' })"
+    if ($AnyGame) { Write-Output 'Any game type and player mix is admitted (-AnyGame). Allied units are hidden from the 1v1 model; resignation is suppressed.' }
+    if ($Opening -eq 'free') { Write-Output 'Opening bandit seeded to the hint-free arm (-Opening free).' }
   } else {
     Write-Output "Pluto ready in StarCraft process $($game.Id). Choose Single Player > Play Custom, Melee, one Computer opponent."
   }

@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <string>
 #include "commands.h"
+#include "unit_order.h"
 
 // Compatibility view for the pinned Pluto binary's direct 1.16.1 memory reads.
 // The bot writes only to this view; commands are collected for SCR translation.
@@ -21,6 +22,12 @@ public:
   unsigned drain(FILE* log,int frame);
   static void __cdecl flush_turn() noexcept;
   uint32_t scr_handle(uint16_t legacy_handle) const;
+  // Players whose units are removed from Pluto's view (allies in any-game mode). Set by the bridge each frame.
+  std::array<bool,8> hide_player{};
+  // Per-update counters for diagnostics: units removed for hidden owners, units cut for the 1700-slot cap.
+  unsigned hidden_units=0,dropped_units=0;
+  // Extra cap on the active list Pluto sees (0 = only the 1700-slot table). Cuts inference time on crowded maps.
+  unsigned max_active_units=0;
 private:
   static constexpr uint32_t first=0x512000,last=0x6d2000,unit_base=0x59cca8;
   std::vector<uint8_t> memory;

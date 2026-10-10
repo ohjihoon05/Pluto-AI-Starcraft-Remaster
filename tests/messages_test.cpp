@@ -76,6 +76,11 @@ int main() {
     "Missing challenge game mode remedy");
   for(const auto reason:{"local_allies_not_supported","requires_opponent","offline_requires_computers"})
     check_utf8(session_messages_ko(s,reason,true));
+  std::strcpy(s.names[1].data(),"Friend#1234");
+  const auto blocked=session_messages_ko(s,"opponent_not_allowed");
+  require(blocked.size()==2 && blocked[0].find("Friend#1234")!=std::string::npos,"Blocked opponent name missing");
+  require(blocked[1].find("-Opponents")!=std::string::npos,"Missing whitelist remedy");
+  check_utf8(blocked);
 
   require(pluto_overlay_text_ko("F1500 win=0.731")==u8"F1500 승률=0.731","Win estimate changed");
   require(pluto_overlay_text_ko("F0 win=n/a")==u8"F0 승률=계산 중","Unavailable win estimate misrepresented");
